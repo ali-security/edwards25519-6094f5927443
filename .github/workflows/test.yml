@@ -1,9 +1,16 @@
 name: Go tests
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional go test -run selector; empty runs the full suite'
+        required: false
+        default: ''
 jobs:
   test:
     name: Go ${{ matrix.go }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         go: [ '1.20', '1.x' ]
@@ -11,7 +18,65 @@ jobs:
       - uses: actions/setup-go@v2
         with: { go-version: "${{ matrix.go }}" }
       - uses: actions/checkout@v2
-      - run: go test -short ./...
-      - run: go test -short -tags purego ./...
+      - shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then RUN=(-run "${{ inputs.test-filter }}"); else RUN=(); fi
+          go test -short -v "${RUN[@]}" ./... | tee /tmp/test-default.log
+          echo "SUMMARY (default): passed=$(grep -c -- '--- PASS' /tmp/test-default.log) failed=$(grep -c -- '--- FAIL' /tmp/test-default.log) skipped=$(grep -c -- '--- SKIP' /tmp/test-default.log)"
+          grep -A2 -- '--- SKIP' /tmp/test-default.log || echo "no skipped tests"
+      - shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then RUN=(-run "${{ inputs.test-filter }}"); else RUN=(); fi
+          go test -short -tags purego -v "${RUN[@]}" ./... | tee /tmp/test-purego.log
+          echo "SUMMARY (purego): passed=$(grep -c -- '--- PASS' /tmp/test-purego.log) failed=$(grep -c -- '--- FAIL' /tmp/test-purego.log) skipped=$(grep -c -- '--- SKIP' /tmp/test-purego.log)"
+          grep -A2 -- '--- SKIP' /tmp/test-purego.log || echo "no skipped tests"
       - run: GOARCH=arm64 go test -c
       - run: GOARCH=arm go test -c
+
+  module-zip:
+    name: Module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24', cache: false }
+      - shell: bash
+        run: |
+          rm -rf /tmp/zipsrc /tmp/helper /tmp/out && mkdir -p /tmp/zipsrc /tmp/helper /tmp/out
+          # Stage the tree without git metadata and the harness-injected .gitignore
+          # (neither ships in the public zip); upstream's .github/workflows/test.yml stays.
+          tar -c --exclude=.git --exclude=.gitignore -C "$GITHUB_WORKSPACE" . | tar -x -C /tmp/zipsrc
+          test ! -e /tmp/zipsrc/.gitignore && test -f /tmp/zipsrc/go.mod
+          cd /tmp/helper
+          go mod init helper
+          GOTOOLCHAIN=local go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  panic(err)
+              }
+              defer f.Close()
+              v := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              if err := zip.CreateFromDir(f, v, os.Args[3]); err != nil {
+                  panic(err)
+              }
+          }
+          EOF
+          go run . filippo.io/edwards25519 v1.1.0 /tmp/zipsrc /tmp/out/v1.1.0.zip
+          unzip -Z1 /tmp/out/v1.1.0.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/out/v1.1.0.zip
+          if-no-files-found: error
